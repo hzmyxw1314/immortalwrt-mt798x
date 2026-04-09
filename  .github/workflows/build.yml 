@@ -1,0 +1,139 @@
+name: Build Firmware
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x
+  REPO_BRANCH: openwrt-21.02
+  CONFIG_FILE: .config
+  DIY_SH: diy.sh
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Check server configuration
+      run: |
+        echo "警告⚠️：分配的服务器配置如下，请知悉"
+        echo "CPU: $(lscpu | grep 'Model name' | awk -F: '{print $2}' | sed 's/^[ \t]*//')"
+        echo "核心数: $(nproc)"
+        echo "内存: $(free -h | grep Mem | awk '{print $2}')"
+        echo "硬盘空间: $(df -h / | grep '/' | awk '{print $2}')"
+        df -h
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(curl -fsSL https://tinyurl.com/depends-ubuntu-2004)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      run: |
+        git clone -b $REPO_BRANCH --single-branch $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        cd openwrt
+        # 更新 feeds
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        # 下载配置文件
+        curl -fsSL https://raw.githubusercontent.com/padavanonly/immortalwrt-mt798x/master/target/linux/mediatek/filogic/base-files/etc/board.d/02_network -o openwrt/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+        
+        # 创建自定义配置脚本
+        cat > diy.sh <<'EOF'
+#!/bin/bash
+
+# 添加自定义插件源 (Lucky)
+echo "src-git lucky https://github.com/gywang/lucky.git;main" >> "feeds.conf.default"
+
+# 更新 feeds
+./scripts/feeds update -a
+./scripts/feeds install -a
+
+# 复制配置文件
+cp .config .config.old
+
+# 开启 OpenClash (核心)
+echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+echo "CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y" >> .config
+
+# 开启 WireGuard
+echo "CONFIG_PACKAGE_luci-app-wireguard=y" >> .config
+echo "CONFIG_PACKAGE_luci-i18n-wireguard-zh-cn=y" >> .config
+echo "CONFIG_PACKAGE_kmod-wireguard=y" >> .config
+echo "CONFIG_PACKAGE_wireguard-tools=y" >> .config
+
+# 开启 SFTP
+echo "CONFIG_PACKAGE_luci-app-sftp=y" >> .config
+echo "CONFIG_PACKAGE_openssh-sftp-server=y" >> .config
+
+# 开启 Lucky
+echo "CONFIG_PACKAGE_luci-app-lucky=y" >> .config
+
+# 移除不需要的插件以节省空间 (精简)
+sed -i '/luci-app-adguardhome/d' .config
+sed -i '/luci-app-docker/d' .config
+sed -i '/luci-app-passwall/d' .config
+sed -i '/luci-app-ssr-plus/d' .config
+sed -i '/luci-app-vssr/d' .config
+sed -i '/luci-app-smartdns/d' .config
+
+# 强制开启编译所需的内核模块
+echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
+echo "CONFIG_PACKAGE_kmod-nft-tproxy=y" >> .config
+
+EOF
+
+        chmod +x diy.sh
+        /bin/bash diy.sh
+
+    - name: Defconfig
+      run: |
+        cd openwrt
+        make defconfig
+
+    - name: Download package
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success'
+      with:
+        name: OpenWrt_bin
+        path: openwrt/bin/
+
